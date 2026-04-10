@@ -1,14 +1,15 @@
 """
 API FastAPI - Credit Risk Prediction
--------------------------------------
-Endpoint principal : POST /predict
-Charge le pipeline XGBoost complet (preprocessing + modele)
-et retourne la probabilite de defaut pour un client.
+--------------------------------------
+Chaque modele a son propre endpoint versionne.
+
+Structure des fichiers :
+
 
 Lancement :
     uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
-Documentation interactive automatique :
+Documentation interactive :
     http://localhost:8000/docs
 """
 
@@ -21,36 +22,74 @@ import uvicorn
 
 
 # --------------------------------------------------
-# Chargement du modele au demarrage du serveur
+# Dossier contenant les modeles
 # --------------------------------------------------
-CHEMIN_MODELE = os.path.join(os.path.dirname(__file__), "model.pkl")
+MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
+
+
+# --------------------------------------------------
+# Chargement des modeles au demarrage
+# --------------------------------------------------
+def charger_modele(nom_fichier: str):
+    chemin = os.path.join(MODELS_DIR, nom_fichier)
+    if not os.path.exists(chemin):
+        raise RuntimeError(
+            f"Modele introuvable : {chemin}\n"
+            f"Placez le fichier {nom_fichier} dans le dossier models/"
+        )
+    with open(chemin, "rb") as f:
+        return pickle.load(f)
+
 
 try:
-    with open(CHEMIN_MODELE, "rb") as f:
-        pipeline = pickle.load(f)
-    print(f"Modele charge depuis : {CHEMIN_MODELE}")
-except FileNotFoundError:
-    raise RuntimeError(
-        f"Fichier model.pkl introuvable : {CHEMIN_MODELE}\n"
-        "Placez model.pkl dans le meme dossier que main.py."
-    )
+    modele_xgboost = charger_modele("xgboost_v1.pkl")
+    print("XGBoost v1 charge.")
+except RuntimeError as e:
+    print(f"ATTENTION : {e}")
+    modele_xgboost = None
+
+try:
+    modele_rf = charger_modele("random_forest_v1.pkl")
+    print("Random Forest v1 charge.")
+except RuntimeError as e:
+    print(f"ATTENTION : {e}")
+    modele_rf = None
 
 
 # --------------------------------------------------
-# Schema de la requete (validation automatique par Pydantic)
+# Registre des modeles disponibles
+# --------------------------------------------------
+MODELES = {
+    "xgboost": {
+        "version": "v1",
+        "fichier": "xgboost_v1.pkl",
+        "pipeline": modele_xgboost,
+        "description": "XGBoost Classifier avec scale_pos_weight"
+    },
+    "random_forest": {
+        "version": "v1",
+        "fichier": "random_forest_v1.pkl",
+        "pipeline": modele_rf,
+        "description": "Random Forest Classifier avec class_weight balanced"
+    }
+}
+
+
+# --------------------------------------------------
+# Schemas Pydantic
 # --------------------------------------------------
 class ClientData(BaseModel):
     person_age: int = Field(..., ge=18, le=100, description="Age du client (18-100 ans)")
     person_income: float = Field(..., gt=0, description="Revenu annuel en dollars")
     person_home_ownership: str = Field(..., description="RENT | OWN | MORTGAGE | OTHER")
-    person_emp_length: float = Field(..., ge=0, le=60, description="Anciennete emploi en annees (0-60)")
+    person_emp_length: float = Field(..., ge=0, le=60, description="Anciennete emploi en annees")
     loan_intent: str = Field(..., description="PERSONAL | EDUCATION | MEDICAL | VENTURE | HOMEIMPROVEMENT | DEBTCONSOLIDATION")
-    loan_grade: str = Field(..., description="Grade du pret : A | B | C | D | E | F | G")
+    loan_grade: str = Field(..., description="A | B | C | D | E | F | G")
     loan_amnt: float = Field(..., gt=0, description="Montant du pret en dollars")
     loan_int_rate: float = Field(..., gt=0, description="Taux d'interet du pret (%)")
-    loan_percent_income: float = Field(..., ge=0, le=1, description="Part du pret dans le revenu (0 a 1)")
+    loan_percent_income: float = Field(..., ge=0, le=1, description="Part du pret dans le revenu")
     cb_person_default_on_file: str = Field(..., description="Antecedent de defaut : Y | N")
-    cb_person_cred_hist_length: int = Field(..., ge=0, description="Duree historique credit (en annees)")
+    cb_person_cred_hist_length: int = Field(..., ge=0, description="Duree historique credit (annees)")
 
     class Config:
         json_schema_extra = {
@@ -70,14 +109,13 @@ class ClientData(BaseModel):
         }
 
 
-# --------------------------------------------------
-# Schema de la reponse
-# --------------------------------------------------
 class PredictionResponse(BaseModel):
-    prediction: int = Field(..., description="0 = Non-defaut | 1 = Defaut")
-    prediction_label: str = Field(..., description="NON-DEFAUT ou DEFAUT")
-    probabilite_defaut: float = Field(..., description="Probabilite estimee de defaut (0 a 1)")
-    niveau_risque: str = Field(..., description="FAIBLE | MODERE | ELEVE | TRES ELEVE")
+    modele: str
+    version: str
+    prediction: int
+    prediction_label: str
+    probabilite_defaut: float
+    niveau_risque: str
 
 
 # --------------------------------------------------
@@ -86,17 +124,18 @@ class PredictionResponse(BaseModel):
 app = FastAPI(
     title="Credit Risk Prediction API",
     description=(
-        "API de prediction du risque de defaut sur un pret bancaire.\n\n"
-        "Modele : XGBoost entraine sur le dataset Credit Risk (Kaggle).\n"
-        "Metrique principale : ROC-AUC.\n\n"
-        "Envoyer les donnees brutes d'un client via POST /predict."
+        "API de prediction du risque de defaut sur un pret.\n\n"
+        "Deux modeles disponibles, chacun accessible via son propre endpoint :\n\n"
+        "- `/predict/xgboost` : XGBoost v1\n"
+        "- `/predict/random_forest` : Random Forest v1\n\n"
+        "Chaque modele est versionne et stocke separement dans le dossier `models/`."
     ),
     version="1.0.0",
 )
 
 
 # --------------------------------------------------
-# Fonction utilitaire : niveau de risque metier
+# Fonction utilitaire
 # --------------------------------------------------
 def get_niveau_risque(proba: float) -> str:
     if proba < 0.20:
@@ -109,95 +148,158 @@ def get_niveau_risque(proba: float) -> str:
         return "TRES ELEVE"
 
 
-# --------------------------------------------------
-# Routes
-# --------------------------------------------------
-@app.get("/", summary="Statut de l'API")
-def root():
-    """Verification que l'API est en ligne."""
-    return {
-        "status": "en ligne",
-        "modele": "XGBoost Credit Risk",
-        "version": "1.0.0",
-        "endpoints": {
-            "prediction_unitaire": "POST /predict",
-            "prediction_batch":    "POST /predict/batch",
-            "documentation":       "GET /docs",
-        }
-    }
+def faire_prediction(nom_modele: str, client: ClientData) -> PredictionResponse:
+    """Logique commune de prediction pour tous les modeles."""
+    if nom_modele not in MODELES:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Modele '{nom_modele}' inconnu. Modeles disponibles : {list(MODELES.keys())}"
+        )
 
+    info = MODELES[nom_modele]
 
-@app.post(
-    "/predict",
-    response_model=PredictionResponse,
-    summary="Predire le risque de defaut pour un client",
-    description=(
-        "Envoyer les donnees d'un client et recevoir :\n"
-        "- La prediction binaire (0 = non-defaut, 1 = defaut)\n"
-        "- La probabilite de defaut entre 0 et 1\n"
-        "- Le niveau de risque : FAIBLE / MODERE / ELEVE / TRES ELEVE"
-    )
-)
-def predict(client: ClientData):
-    """
-    Prediction du risque de defaut pour un client.
+    if info["pipeline"] is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Modele '{nom_modele}' non disponible. Verifiez que {info['fichier']} est present dans models/"
+        )
 
-    - **prediction** : 0 = non-defaut, 1 = defaut
-    - **probabilite_defaut** : score entre 0 et 1
-    - **niveau_risque** : interpretation metier du score
-    """
     try:
-        # Convertir la requete en DataFrame (format attendu par le pipeline sklearn)
         donnees = pd.DataFrame([client.model_dump()])
-
-        # Prediction via le pipeline complet (preprocessing + XGBoost)
-        prediction  = int(pipeline.predict(donnees)[0])
-        probabilite = float(pipeline.predict_proba(donnees)[0][1])
+        prediction = int(info["pipeline"].predict(donnees)[0])
+        probabilite = float(info["pipeline"].predict_proba(donnees)[0][1])
 
         return PredictionResponse(
+            modele=nom_modele,
+            version=info["version"],
             prediction=prediction,
             prediction_label="DEFAUT" if prediction == 1 else "NON-DEFAUT",
             probabilite_defaut=round(probabilite, 4),
             niveau_risque=get_niveau_risque(probabilite)
         )
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur de prediction : {str(e)}")
 
 
+# --------------------------------------------------
+# Routes generales
+# --------------------------------------------------
+@app.get("/", summary="Statut de l'API")
+def root():
+    """Retourne le statut de l'API et la liste des modeles disponibles."""
+    return {
+        "status": "en ligne",
+        "version_api": "1.0.0",
+        "modeles_disponibles": {
+            nom: {
+                "version": info["version"],
+                "description": info["description"],
+                "disponible": info["pipeline"] is not None,
+                "endpoint": f"/predict/{nom}"
+            }
+            for nom, info in MODELES.items()
+        }
+    }
+
+
+@app.get("/models", summary="Liste des modeles")
+def liste_modeles():
+    """Retourne la liste de tous les modeles avec leur statut."""
+    return {
+        nom: {
+            "version": info["version"],
+            "fichier": info["fichier"],
+            "description": info["description"],
+            "disponible": info["pipeline"] is not None
+        }
+        for nom, info in MODELES.items()
+    }
+
+
+# --------------------------------------------------
+# Routes de prediction par modele
+# --------------------------------------------------
 @app.post(
-    "/predict/batch",
-    summary="Prediction en lot (plusieurs clients)",
-    description="Envoyer une liste de clients et recevoir toutes les predictions en une seule requete (max 1000)."
+    "/predict/xgboost",
+    response_model=PredictionResponse,
+    summary="Prediction avec XGBoost v1",
+    tags=["XGBoost"]
 )
-def predict_batch(clients: list[ClientData]):
-    """Prediction pour une liste de clients (maximum 1000)."""
+def predict_xgboost(client: ClientData):
+    """
+    Prediction du risque de defaut avec le modele XGBoost v1.
+
+    XGBoost est un algorithme de boosting. Il construit des arbres de decision
+    en sequence, chacun corrigeant les erreurs du precedent.
+    """
+    return faire_prediction("xgboost", client)
+
+
+@app.post(
+    "/predict/random_forest",
+    response_model=PredictionResponse,
+    summary="Prediction avec Random Forest v1",
+    tags=["Random Forest"]
+)
+def predict_random_forest(client: ClientData):
+    """
+    Prediction du risque de defaut avec le modele Random Forest v1.
+
+    Random Forest est un algorithme de bagging. Il entraine plusieurs arbres
+    en parallele sur des sous-echantillons differents et fait la moyenne des resultats.
+    """
+    return faire_prediction("random_forest", client)
+
+
+@app.post(
+    "/predict/batch/{nom_modele}",
+    summary="Prediction en lot pour un modele donne",
+    tags=["Batch"]
+)
+def predict_batch(nom_modele: str, clients: list[ClientData]):
+    """
+    Prediction pour plusieurs clients avec le modele choisi.
+
+    Remplacer {nom_modele} par : xgboost ou random_forest
+    """
     if len(clients) == 0:
         raise HTTPException(status_code=400, detail="La liste de clients est vide.")
     if len(clients) > 1000:
-        raise HTTPException(status_code=400, detail="Maximum 1000 clients par requete batch.")
+        raise HTTPException(status_code=400, detail="Maximum 1000 clients par requete.")
+
+    if nom_modele not in MODELES:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Modele '{nom_modele}' inconnu. Disponibles : {list(MODELES.keys())}"
+        )
+
+    info = MODELES[nom_modele]
+    if info["pipeline"] is None:
+        raise HTTPException(status_code=503, detail=f"Modele '{nom_modele}' non disponible.")
 
     try:
-        donnees      = pd.DataFrame([c.model_dump() for c in clients])
-        predictions  = pipeline.predict(donnees).tolist()
-        probabilites = pipeline.predict_proba(donnees)[:, 1].tolist()
+        donnees = pd.DataFrame([c.model_dump() for c in clients])
+        predictions = info["pipeline"].predict(donnees).tolist()
+        probabilites = info["pipeline"].predict_proba(donnees)[:, 1].tolist()
 
         resultats = []
         for pred, proba in zip(predictions, probabilites):
             resultats.append({
-                "prediction":         int(pred),
-                "prediction_label":   "DEFAUT" if pred == 1 else "NON-DEFAUT",
+                "prediction": int(pred),
+                "prediction_label": "DEFAUT" if pred == 1 else "NON-DEFAUT",
                 "probabilite_defaut": round(float(proba), 4),
-                "niveau_risque":      get_niveau_risque(float(proba))
+                "niveau_risque": get_niveau_risque(float(proba))
             })
 
         return {
+            "modele": nom_modele,
+            "version": info["version"],
             "nombre_clients": len(clients),
-            "predictions":    resultats
+            "predictions": resultats
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur de prediction batch : {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erreur : {str(e)}")
 
 
 # --------------------------------------------------
